@@ -59,6 +59,14 @@
   变化导致摘要不同则 **409 且不写入**；`resolved` 须给出涉及的收据或更正
   `request_key` 并证明重算后原事件消失、剂量未越限，`accepted` 保留事件并
   记录理由；相同 `request_key` 重放原结果，快照不可变。
+- 支持**展厅开放批次合规核验**：提交 `request_key`、核验时间窗、盘点
+  `round_id`、展品 ID 清单与诊断阈值，服务在**一个 SQLite 写事务**内解析
+  别名并读取该轮次固化对账结果、展陈日历、截至窗口末的 `calendar=display`
+  剂量、完整诊断事件与照度处置单状态；只有所有展品均在盘点中**定位到预期
+  区域**、窗口内**无 gap / jump / stuck**、**开放剂量未越限**且**没有未结
+  处置单**时，才固化包含各项证据摘要的**合规凭证**；任一失败返回**逐件原因**
+  且不写入；同一 `request_key` 仅在规范化输入与当时证据摘要一致时重放，
+  否则 **409**。
 - 提供**可验证的 SQLite 在线快照**：`sqlite3.Connection.backup` 热备生成
   事务一致副本（临时文件 → SHA-256 + 清单 → 原子重命名发布），支持
   创建 / 列表 / 下载，并可在独立只读连接上核对哈希、执行
@@ -113,6 +121,8 @@ SQLite 数据文件存放在命名卷 `lightdose-data`（容器内 `/data/lightd
 | POST | `/merges/commit` | 按令牌与裁决提交归并（单事务，令牌可重放） |
 | POST | `/inventory-rounds/{round_id}/reconcile` | 执行 RFID 盘点对账并固化（摘要绑定，重放/409） |
 | GET | `/inventory-rounds/{round_id}` | 取回已固化的盘点对账结果（未对账 → 404） |
+| POST | `/opening-batches/verify` | 展厅开放批次合规核验：单事务核验盘点定位/诊断事件/开放剂量/处置单，全部通过才固化合规凭证（request_key 幂等，失败逐件原因不写入） |
+| GET | `/opening-batches/{credential_id}` | 取回已固化的合规凭证（含各项证据摘要；不存在 → 404） |
 | POST | `/evacuation-plan` | 展品应急撤离编排（时变最早到达、容量等待、封闭绕行；纯只读） |
 | POST | `/snapshots` | 创建 SQLite 在线快照（事务一致；并发仅一个，其余 409） |
 | GET | `/snapshots` | 列出已发布快照（失败 / 未完成文件不出现） |
@@ -1036,6 +1046,144 @@ curl -i -X POST http://localhost:8000/illumination-tickets/7f3a…/close \
 再次结案 → 409；摘要核对失败 / resolved 证明失败 → 409；resolved 缺少证据
 或证据不属于本档案、accepted 携带证据 → 422。
 
+## 展厅开放批次合规核验
+
+`POST /opening-batches/verify` 为一批展品做**展厅开放批次合规核验**：调用方
+提交 `request_key`、核验时间窗、盘点 `round_id`、展品 ID 清单（可用归并
+别名）与诊断阈值（与诊断接口同口径），服务在**一个 SQLite 写事务**
+（`BEGIN IMMEDIATE`）内完成：
+
+1. **别名解析**：展品 ID 全部解析为规范档案（不存在 → 404；解析后同一规范
+   档案出现多次 → 422）；
+2. **读取该轮次固化对账结果**（与 `GET /inventory-rounds/{round_id}` 同源；
+   轮次不存在 → 404）；
+3. 逐件按未作废权威时间线重算**完整诊断事件**（与
+   `POST /exhibits/{id}/readings/diagnose` 同口径）与**截至窗口末的**
+   **`calendar=display` 剂量**（与 `GET /dose?calendar=display` 同口径，
+   需展陈开放日历）；
+4. 读取**照度处置单状态**（未结 `open` 处置单）。
+
+**合规条件（逐件判定，全部满足才固化凭证）**：
+
+- 在该轮盘点中**定位到预期区域**（缺失 / 错位 / 位置不明 / 意外出现 /
+  不在预期清单均不合规）；
+- 窗口内**无 `gap`、`jump` 或 `stuck`** 诊断事件（`timestamp_conflict`
+  只记入证据、不阻断核验）；
+- **开放剂量未越限**（截至窗口末的 `calendar=display` 累计未达上限；
+  未配置展陈开放日历的展品不合规）；
+- **没有未结（`open`）照度处置单**。
+
+**结果与幂等**：
+
+- 全部通过 → 固化包含**各项证据摘要**的合规凭证（盘点定位、诊断事件、
+  开放剂量、未结处置单，以及未作废读数 / 来源优先级 / 日历指纹），返回
+  `credential_id` 与凭证摘要 `digest`；凭证只增不改，可用
+  `GET /opening-batches/{credential_id}` 取回；
+- 任一失败 → 返回**逐件原因**（`compliant=false`，每件展品给出
+  `failure_reasons` 与证据摘要）且**不写入**，`request_key` 不被占用，
+  处置后可用同一键重试；
+- 相同 `request_key` 仅在**规范化输入**（时间统一 UTC、别名解析后的规范
+  档案清单排序去重、轮次、窗口、阈值）与**当时证据摘要**都一致时重放首次
+  凭证（`already_committed=true`）；输入不同、或读数 / 作废 / 来源优先级 /
+  日历 / 处置单 / 归并归属变化导致证据摘要重算不一致 → **409**；
+- 并发提交相同 `request_key`：只固化一份凭证，竞争方全部回放。
+
+### 26. 提交一次开放批次核验
+
+```bash
+curl -s -X POST http://localhost:8000/opening-batches/verify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "open-2026-09-21-am",
+    "round_id": "ROUND-2026-09-21-01",
+    "start": "2026-09-21T08:00:00Z",
+    "end": "2026-09-21T12:00:00Z",
+    "exhibit_ids": ["EX-001", "EX-002"],
+    "max_rate_lux_per_second": 1.0,
+    "stuck_tolerance_lux": 2.0,
+    "min_stuck_seconds": 1800
+  }'
+```
+
+全部通过时固化合规凭证（每件展品的 `evidence` 即固化的证据摘要）：
+
+```json
+{
+  "request_key": "open-2026-09-21-am",
+  "round_id": "ROUND-2026-09-21-01",
+  "start": "2026-09-21T08:00:00Z", "end": "2026-09-21T12:00:00Z",
+  "max_rate_lux_per_second": 1.0, "stuck_tolerance_lux": 2.0,
+  "min_stuck_seconds": 1800.0,
+  "compliant": true,
+  "credential_id": "9d2f…",
+  "digest": "c41a…",
+  "request_digest": "7b3e…", "evidence_digest": "e90d…",
+  "exhibits": [
+    {"requested_id": "EX-001", "canonical_id": "EX-001",
+     "compliant": true, "failure_reasons": [],
+     "evidence": {
+       "inventory": {"status": "located", "expected_area": "A区展柜",
+                     "located_area": "A区展柜"},
+       "events": [],
+       "dose": {"dose_limit_luxh": 150.0, "known_dose_luxh": 40.0,
+                "remaining_luxh": 110.0, "exceeded": false,
+                "first_exceeded_at": null, "unknown_seconds": 0.0,
+                "covered_seconds": 14400.0, "closed_seconds": 0.0,
+                "reading_count": 5},
+       "open_ticket_ids": [],
+       "readings_fingerprint": "…", "source_priority_fingerprint": "…",
+       "calendar_fingerprint": "…"
+     }}
+  ],
+  "created_at": "2026-09-21T12:05:00.000Z",
+  "already_committed": false
+}
+```
+
+任一失败时返回逐件原因且**不写入**（`request_key` 不被占用，处置后可用
+同一键重试）：
+
+```json
+{
+  "compliant": false,
+  "credential_id": null, "digest": null, "created_at": null,
+  "exhibits": [
+    {"requested_id": "EX-001", "canonical_id": "EX-001",
+     "compliant": true, "failure_reasons": [], "evidence": {"…": "…"}},
+    {"requested_id": "EX-002", "canonical_id": "EX-002",
+     "compliant": false,
+     "failure_reasons": [
+       "盘点错位：预期区域 A区展柜，实际定位到 C区库房",
+       "窗口内存在缺测 gap事件（2026-09-21T09:00:00Z 至 2026-09-21T11:00:00Z）",
+       "存在 1 张未结照度处置单：7f3a…"
+     ],
+     "evidence": {"…": "…"}}
+  ],
+  "already_committed": false
+}
+```
+
+### 27. 查询凭证与幂等重放
+
+```bash
+# 按凭证 ID 取回已固化的合规凭证（含各项证据摘要；不存在 → 404）
+curl -s http://localhost:8000/opening-batches/9d2f…
+
+# 相同 request_key + 规范化输入一致 + 当时证据摘要一致 → 重放首次凭证
+curl -s -X POST http://localhost:8000/opening-batches/verify \
+  -H 'Content-Type: application/json' -d '{ "request_key": "open-2026-09-21-am", "...": "同一请求" }'
+# {"credential_id": "9d2f…", "already_committed": true, ...}
+
+# 同一 request_key 换输入（轮次/窗口/清单/阈值任一不同）→ 409
+# 核验后读数/作废/来源优先级/日历/处置单/归并归属发生变化 → 同样 409
+# {"detail": "request_key open-2026-09-21-am 核验时的证据摘要已变化
+#  （读数/作废/来源优先级/日历/处置单状态或归并归属已变），不能重放首次凭证；…"}
+```
+
+错误码小结：展品不存在 → 404；盘点轮次不存在 → 404；凭证不存在 → 404；
+别名解析后清单重复、`end` 不晚于 `start`、阈值非法 → 422；
+`request_key` 换目标或证据摘要已变化 → 409。
+
 ## 核算语义
 
 - **梯形法**：相邻两条权威读数之间照度按线性变化处理，
@@ -1516,8 +1664,9 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── receipts.py  # 照度上报存证：收据规范序列化、SHA-256 链哈希、整链校验
 │   ├── corrections.py # 上报批次更正：作废收据中实际插入的读数、request_key 幂等、前置变化整次 409
 │   ├── tickets.py   # 照度异常处置单：创建时单事务重算诊断/剂量/链尾并固化快照，结案重算核对（409 不写入）、resolved 举证
+│   ├── opening.py   # 展厅开放批次合规核验：单事务核验盘点定位/诊断事件/开放剂量/处置单，全部通过才固化凭证，request_key 重放/409
 │   ├── snapshots.py # SQLite 在线快照：backup 热备、临时文件 + SHA-256 清单 + 原子重命名、只读校验
-│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions / illumination_tickets）
+│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions / illumination_tickets / opening_batch_credentials）
 │   └── schemas.py   # Pydantic 请求/响应模型
 ├── tests/
 │   ├── test_api.py       # 剂量核算与归并
@@ -1529,6 +1678,7 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── test_inventory.py # RFID 盘点对账：窗口定位、四类差异、别名解析、摘要重放/409、并发固化、隔离性
 │   ├── test_evacuation.py # 应急撤离：容量竞争、半开封闭等待/绕行、路径字典序平局、别名重复 422、无出口 422、只读隔离
 │   ├── test_tickets.py   # 照度异常处置单：快照固化与 digest、request_key 重放/换目标 409、结案核对 409、resolved 举证、并发
+│   ├── test_opening.py   # 开放批次合规核验：凭证固化、逐件原因、request_key 重放/换目标 409、状态变化 409、别名、并发
 │   └── test_snapshots.py # 在线快照：事务一致副本、409 并发、原子发布、下载、只读校验与防篡改
 ├── requirements.txt         # 运行时依赖（含 tzdata，保证容器内 IANA 时区数据库可用）
 ├── requirements-dev.txt     # 测试依赖

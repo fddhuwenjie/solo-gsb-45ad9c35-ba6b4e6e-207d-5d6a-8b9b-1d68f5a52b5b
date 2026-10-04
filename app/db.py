@@ -187,6 +187,28 @@ CREATE TABLE IF NOT EXISTS illumination_tickets (
     closed_digest           TEXT                   -- 结案时重算核对的摘要
 );
 
+-- 展厅开放批次合规核验凭证：只有全部展品都通过核验（盘点定位到预期区域、
+-- 窗口内无 gap/jump/stuck、calendar=display 开放剂量未越限、无未结处置单）
+-- 才在单个写事务内固化；任一失败返回逐件原因、不写入。
+-- request_key 为幂等键：重放要求规范化输入摘要（request_digest）与当时证据
+-- 摘要（evidence_digest）都一致，否则 409；凭证只增不改（无 UPDATE），
+-- 与 ingest_receipts 一样故意不设外键、不级联删除，供事后独立核查。
+CREATE TABLE IF NOT EXISTS opening_batch_credentials (
+    request_key             TEXT PRIMARY KEY,        -- 核验幂等键
+    credential_id           TEXT NOT NULL UNIQUE,    -- 凭证 ID（GET 查询用）
+    round_id                TEXT NOT NULL,           -- 核验所依据的盘点轮次
+    start_s                 REAL NOT NULL,           -- 核验窗口起点，Unix 秒（UTC）
+    end_s                   REAL NOT NULL,           -- 核验窗口终点，Unix 秒（UTC）
+    max_rate_lux_per_second REAL NOT NULL,           -- 诊断阈值：突变速率上限（lux/秒）
+    stuck_tolerance_lux     REAL NOT NULL,           -- 诊断阈值：卡死容差（lux）
+    min_stuck_seconds       REAL NOT NULL,           -- 诊断阈值：卡死最短持续（秒）
+    request_digest          TEXT NOT NULL,           -- 规范化输入摘要 SHA-256
+    evidence_digest         TEXT NOT NULL,           -- 固化时的证据摘要 SHA-256（当时摘要）
+    digest                  TEXT NOT NULL,           -- 凭证摘要 SHA-256（输入+证据）
+    credential_json         TEXT NOT NULL,           -- 固化的合规凭证（含各项证据摘要）
+    created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 -- 多来源读数仲裁：来源优先级版本。每版携带生效时刻 effective_at 与来源
 -- 优先级列表（JSON 数组，靠前优先级更高；未列入的来源并列最低）。
 -- 版本只增不改：配置更新必须携带 expected_version（当前最新版本号），

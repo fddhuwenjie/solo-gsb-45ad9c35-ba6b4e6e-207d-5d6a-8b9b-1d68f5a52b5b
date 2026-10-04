@@ -1,4 +1,4 @@
-"""FastAPI 应用入口：展品登记、读数上报（幂等 + 存证收据）、剂量时段查询、展陈开放日历、重复档案归并、RFID 盘点对账、多来源读数仲裁、照度异常处置单。"""
+"""FastAPI 应用入口：展品登记、读数上报（幂等 + 存证收据）、剂量时段查询、展陈开放日历、重复档案归并、RFID 盘点对账、多来源读数仲裁、照度异常处置单、展厅开放批次合规核验。"""
 from __future__ import annotations
 
 import json
@@ -33,6 +33,7 @@ from .dose import compute_dose
 from .evacuation import EvacuationGraph, EvacuationGraphError, plan_evacuation
 from .inventory import load_round, reconcile_round
 from .merge import commit_merge, create_preview, get_canonical_or_404, resolve_canonical
+from .opening import get_credential, verify_opening_batch
 from .receipts import (
     ChainVerification,
     load_chain,
@@ -69,6 +70,9 @@ from .schemas import (
     MergeCommitRequest,
     MergePreviewOut,
     MergePreviewRequest,
+    OpeningBatchCredentialOut,
+    OpeningBatchVerifyOut,
+    OpeningBatchVerifyRequest,
     ReadingBatch,
     ReadingCorrectionOut,
     ReadingCorrectionRequest,
@@ -146,7 +150,14 @@ app = FastAPI(
                 "（request_key 幂等，快照不可变）；结案只能从 open 到 resolved/accepted，"
                 "提交 expected_digest 与当前重算核对（读数/作废/来源优先级/日历/收据链"
                 "变化导致不一致 → 409 不写入），resolved 须举证涉及收据或更正 "
-                "request_key 并证明原事件消失且剂量未越限，accepted 保留事件并记录理由。",
+                "request_key 并证明原事件消失且剂量未越限，accepted 保留事件并记录理由。"
+                "支持展厅开放批次合规核验：提交 request_key、核验时间窗、盘点 round_id、"
+                "展品清单与诊断阈值，在一个 SQLite 写事务内解析别名并读取该轮次固化结果、"
+                "展陈日历、截至窗口末的 calendar=display 剂量、完整诊断事件与照度处置单"
+                "状态；只有所有展品均在盘点中定位到预期区域、窗口内无 gap/jump/stuck、"
+                "开放剂量未越限且无未结处置单时，才固化包含各项证据摘要的合规凭证；"
+                "任一失败返回逐件原因且不写入；同一 request_key 仅在规范化输入与当时"
+                "证据摘要一致时重放，否则 409。",
     lifespan=lifespan,
 )
 
@@ -1191,6 +1202,62 @@ def get_inventory_round(
     if result is None:
         raise HTTPException(status_code=404, detail=f"盘点轮次不存在或尚未对账: {round_id}")
     return result
+
+
+# ---------- 展厅开放批次合规核验 ----------
+
+@app.post("/opening-batches/verify", response_model=OpeningBatchVerifyOut,
+          tags=["opening-batches"])
+def verify_opening_batch_endpoint(
+    payload: OpeningBatchVerifyRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> OpeningBatchVerifyOut:
+    """对一批展品做展厅开放批次合规核验；全部通过才固化合规凭证。
+
+    调用方提交 ``request_key``、核验时间窗、盘点 ``round_id``、展品 ID 清单
+    （可用归并别名）与诊断阈值（与诊断接口同口径）。服务在**一个 SQLite 写
+    事务**（``BEGIN IMMEDIATE``）内完成：别名解析 → 读取该轮次**固化对账
+    结果** → 逐件按未作废权威时间线重算**完整诊断事件**（与诊断接口同口径）
+    与**截至窗口末的 calendar=display 剂量**（与剂量接口同口径）→ 读取
+    **照度处置单状态**。
+
+    合规条件（逐件判定，全部满足才固化）：
+
+    - 在该轮盘点中**定位到预期区域**（缺失 / 错位 / 位置不明 / 意外出现 /
+      不在预期清单均不合规）；
+    - 窗口内**无 gap、jump 或 stuck** 诊断事件（``timestamp_conflict`` 只记入
+      证据、不阻断核验）；
+    - **开放剂量未越限**（截至窗口末的 calendar=display 累计未达上限；
+      未配置展陈开放日历的展品不合规）；
+    - **没有未结（open）照度处置单**。
+
+    结果与幂等：
+
+    - 全部通过 → 固化包含**各项证据摘要**（盘点定位、诊断事件、开放剂量、
+      未结处置单与读数/日历/来源优先级指纹）的合规凭证，返回 ``credential_id``
+      与凭证摘要 ``digest``；
+    - 任一失败 → 返回**逐件原因**（``compliant=false``）且**不写入**，
+      ``request_key`` 不被占用，处置后可用同一键重试；
+    - 相同 ``request_key`` 仅在**规范化输入**（时间 UTC、别名解析后的规范
+      档案清单、轮次、窗口、阈值）与**当时证据摘要**都一致时重放首次凭证
+      （``already_committed=true``），否则 **409**；
+    - 展品不存在 → 404；盘点轮次不存在 → 404；别名解析后清单重复 → 422；
+      ``end`` 不晚于 ``start`` → 422。
+    """
+    return verify_opening_batch(conn, payload)
+
+
+@app.get("/opening-batches/{credential_id}", response_model=OpeningBatchCredentialOut,
+         tags=["opening-batches"])
+def get_opening_batch_credential(
+    credential_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> OpeningBatchCredentialOut:
+    """按 credential_id 取回已固化的合规凭证（含各项证据摘要）；不存在 → 404。"""
+    out = get_credential(conn, credential_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail=f"合规凭证不存在: {credential_id}")
+    return out
 
 
 # ---------- 展品应急撤离编排（纯只读计算） ----------

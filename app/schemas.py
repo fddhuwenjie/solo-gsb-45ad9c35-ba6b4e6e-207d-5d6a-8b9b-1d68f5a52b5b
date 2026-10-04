@@ -1066,3 +1066,138 @@ class IlluminationTicketCloseOut(IlluminationTicketOut):
         default=None,
         description="resolved 结案证明：重算后 calendar=display 剂量是否越限（结案要求为 false）",
     )
+
+
+# ---------- 展厅开放批次合规核验 ----------
+
+class OpeningBatchVerifyRequest(BaseModel):
+    """展厅开放批次合规核验请求：时间窗 + 盘点轮次 + 展品清单 + 诊断阈值 + 幂等键。"""
+
+    request_key: str = Field(
+        min_length=1, max_length=200,
+        description="核验幂等键：相同 request_key 仅在规范化输入与当时证据摘要都一致时"
+                    "重放首次凭证，否则 409；核验失败不写入、不占用 request_key",
+    )
+    round_id: str = Field(
+        min_length=1, max_length=200,
+        description="盘点轮次 ID：读取其固化对账结果，判定每件展品是否定位到预期区域",
+    )
+    start: datetime = Field(description="核验窗口起点（含），ISO 8601；缺省时区按 UTC 处理")
+    end: datetime = Field(description="核验窗口终点（含），ISO 8601；缺省时区按 UTC 处理")
+    exhibit_ids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        min_length=1, max_length=10000,
+        description="展品 ID 清单（可用归并别名，提交时解析为规范档案）；"
+                    "解析后同一规范档案出现多次 → 422",
+    )
+    max_rate_lux_per_second: float = Field(
+        gt=0, description="照度最大允许变化速率（lux/秒），与诊断接口同口径",
+    )
+    stuck_tolerance_lux: float = Field(
+        ge=0, description="卡死容差（lux），与诊断接口同口径",
+    )
+    min_stuck_seconds: float = Field(
+        gt=0, description="卡死事件最短持续时长（秒），与诊断接口同口径",
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        return ensure_aware(v)
+
+
+class OpeningBatchInventoryOut(BaseModel):
+    """一件展品在盘点轮次固化结果中的定位证据。"""
+
+    status: Literal[
+        "located", "missing", "misplaced", "unknown_position", "unexpected", "not_expected"
+    ] = Field(
+        description="located：定位到预期区域（合规）；missing：预期但全程无有效事件；"
+                    "misplaced：定位区域与预期不同；unknown_position：信号歧义位置不明；"
+                    "unexpected：不在预期清单但被读到；not_expected：不在预期清单且无事件",
+    )
+    expected_area: str | None = Field(description="轮次中的预期区域；不在预期清单为 null")
+    located_area: str | None = Field(
+        description="盘点判定的实际区域；缺失 / 位置不明 / 无事件为 null",
+    )
+
+
+class OpeningBatchEvidenceOut(BaseModel):
+    """一件展品的核验证据摘要（与凭证一起固化）。"""
+
+    inventory: OpeningBatchInventoryOut = Field(description="盘点轮次定位证据")
+    events: list[DiagnosisEventOut] = Field(
+        description="按未作废权威时间线在完整时间线上形成、与核验窗口相交的诊断事件"
+                    "（与诊断接口同口径）；gap / jump / stuck 为不合规事件",
+    )
+    dose: TicketDoseOut | None = Field(
+        description="截至窗口末的 calendar=display 剂量（与剂量接口同口径）；"
+                    "未配置展陈开放日历为 null（该展品不合规）",
+    )
+    open_ticket_ids: list[str] = Field(
+        description="该规范档案当前未结（open）的照度异常处置单 ID；合规要求为空",
+    )
+    readings_fingerprint: str = Field(description="未作废读数集合指纹：读数或作废变化即变")
+    source_priority_fingerprint: str = Field(description="来源优先级版本配置指纹")
+    calendar_fingerprint: str | None = Field(
+        description="展陈开放日历配置指纹；未配置日历为 null",
+    )
+
+
+class OpeningBatchExhibitOut(BaseModel):
+    """一件展品的逐件核验结果。"""
+
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="别名解析后的规范档案 ID")
+    compliant: bool = Field(description="该展品是否通过全部核验")
+    failure_reasons: list[str] = Field(description="逐项不合规原因；合规时为空列表")
+    evidence: OpeningBatchEvidenceOut = Field(description="核验证据摘要")
+
+
+class OpeningBatchVerifyOut(BaseModel):
+    """核验响应：全部通过时固化合规凭证；任一失败返回逐件原因且不写入。"""
+
+    request_key: str
+    round_id: str
+    start: str = Field(description="核验窗口起点（UTC，ISO 8601，Z 结尾）")
+    end: str = Field(description="核验窗口终点（UTC，ISO 8601，Z 结尾）")
+    max_rate_lux_per_second: float
+    stuck_tolerance_lux: float
+    min_stuck_seconds: float
+    compliant: bool = Field(description="全部展品是否都通过核验（通过才固化凭证）")
+    credential_id: str | None = Field(description="合规凭证 ID；不合规（未固化）为 null")
+    digest: str | None = Field(
+        description="凭证摘要（规范化输入摘要 + 证据摘要的 SHA-256）；不合规为 null",
+    )
+    request_digest: str = Field(description="规范化输入摘要（SHA-256）：request_key 与之绑定")
+    evidence_digest: str = Field(
+        description="证据摘要（SHA-256）：重放时按当前状态重算，与固化值不一致 → 409",
+    )
+    exhibits: list[OpeningBatchExhibitOut] = Field(
+        description="逐件核验结果（按请求顺序），含证据摘要与逐项不合规原因",
+    )
+    created_at: str | None = Field(
+        description="凭证固化时刻（UTC，ISO 8601，Z 结尾）；不合规（未固化）为 null",
+    )
+    already_committed: bool = Field(
+        description="true 表示相同 request_key 重放，返回的是首次固化的凭证",
+    )
+
+
+class OpeningBatchCredentialOut(BaseModel):
+    """已固化的展厅开放批次合规凭证（GET 取回的形态，不可变）。"""
+
+    credential_id: str
+    request_key: str
+    round_id: str
+    start: str
+    end: str
+    max_rate_lux_per_second: float
+    stuck_tolerance_lux: float
+    min_stuck_seconds: float
+    digest: str = Field(description="凭证摘要（规范化输入摘要 + 证据摘要的 SHA-256）")
+    request_digest: str = Field(description="规范化输入摘要（SHA-256）")
+    evidence_digest: str = Field(description="固化时的证据摘要（SHA-256，当时摘要）")
+    exhibits: list[OpeningBatchExhibitOut] = Field(
+        description="逐件证据摘要（全部合规，failure_reasons 为空）",
+    )
+    created_at: str = Field(description="凭证固化时刻（UTC，ISO 8601，Z 结尾）")
