@@ -59,6 +59,13 @@
   变化导致摘要不同则 **409 且不写入**；`resolved` 须给出涉及的收据或更正
   `request_key` 并证明重算后原事件消失、剂量未越限，`accepted` 保留事件并
   记录理由；相同 `request_key` 重放原结果，快照不可变。
+- 支持**展厅开放批次合规核验**：提交 `request_key`、核验时间窗、盘点
+  `round_id`、展品 ID 清单与诊断阈值，服务在**一个 SQLite 写事务**内解析
+  别名、读取该轮次固化结果、逐件重算截至窗口末的 `calendar=display` 剂量
+  与完整诊断事件并检查未结处置单；只有全部展品都定位到预期区域、窗口内无
+  gap / jump / stuck、开放剂量未越限且无未结处置单时，才固化包含各项证据
+  摘要的**合规凭证**；任一失败返回逐件原因且**不写入**；同一 `request_key`
+  仅在规范化输入与当时摘要一致时重放，否则 **409**。
 - 提供**可验证的 SQLite 在线快照**：`sqlite3.Connection.backup` 热备生成
   事务一致副本（临时文件 → SHA-256 + 清单 → 原子重命名发布），支持
   创建 / 列表 / 下载，并可在独立只读连接上核对哈希、执行
@@ -105,6 +112,8 @@ SQLite 数据文件存放在命名卷 `lightdose-data`（容器内 `/data/lightd
 | GET | `/exhibits/{id}/illumination-tickets` | 列出规范档案的全部处置单（别名自动解析） |
 | GET | `/illumination-tickets/{ticket_id}` | 查询单张处置单；open 状态附带实时重算的 `current_digest` |
 | POST | `/illumination-tickets/{ticket_id}/close` | 结案：open → resolved / accepted（expected_digest 核对，不一致 409 不写入） |
+| POST | `/compliance-checks` | 展厅开放批次合规核验：单事务核验，全部通过才固化合规凭证（request_key 幂等；失败逐件原因、不写入） |
+| GET | `/compliance-checks/{request_key}` | 取回已固化的合规凭证（未固化 → 404） |
 | GET | `/receipts/chains/{chain_id}` | 按链标识直接读取收据链（不解析别名） |
 | GET | `/receipts/chains/{chain_id}/verify` | 按链标识整链校验（归并后来源链核查） |
 | POST | `/exhibits/{id}/readings/diagnose` | 照度采集质量诊断（gap / jump / stuck / 时间冲突，只读） |
@@ -1036,6 +1045,165 @@ curl -i -X POST http://localhost:8000/illumination-tickets/7f3a…/close \
 再次结案 → 409；摘要核对失败 / resolved 证明失败 → 409；resolved 缺少证据
 或证据不属于本档案、accepted 携带证据 → 422。
 
+## 展厅开放批次合规核验
+
+`POST /compliance-checks` 为一批展品做"展厅开放"合规核验：调用方提交
+`request_key`、核验时间窗、盘点 `round_id`、展品 ID 清单与诊断阈值，服务在
+**一个 SQLite 写事务**（`BEGIN IMMEDIATE`）内完成全部检查；只有所有展品都
+通过，才固化包含各项证据摘要的**合规凭证**并返回 `digest`；任一项失败返回
+逐件原因（`status=non_compliant`），**不写入任何记录**，`request_key`
+不占用。
+
+### 核验口径（全部在同一写事务内）
+
+- 展品 ID 先经归并别名解析为规范档案（不存在 → 404；解析后同一规范档案
+  出现多次 → 422）；
+- 读取 `round_id` 对应轮次的**固化**盘点结果（轮次尚未对账 → 404）；
+- 逐件读取展陈日历，按与 `GET /dose?calendar=display` 同口径重算**截至
+  窗口末的开放剂量**；
+- 按与 `POST /readings/diagnose` 同口径在完整未作废权威时间线上形成诊断
+  事件，筛选与核验窗口相交的部分；
+- 检查该规范档案当前**未结（open）的照度异常处置单**。
+
+### 合规条件（四项全部满足才固化凭证）
+
+1. 每件展品都在盘点轮次中**定位到预期区域**（缺失 / 错位 / 位置不明 /
+   意外出现 / 轮次未涵盖均为不合规）；
+2. 窗口内无 `gap` / `jump` / `stuck` 诊断事件（`timestamp_conflict`
+   只记入证据，不阻断合规）；
+3. 截至窗口末的 `calendar=display` 开放剂量**未越限**（展品未配置展陈
+   日历视为无法核验、不合规）；
+4. 没有未结（open）照度异常处置单。
+
+### 26. 提交一次合规核验
+
+```bash
+curl -s -X POST http://localhost:8000/compliance-checks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "hall-open-2026-10-01-am",
+    "round_id": "ROUND-2026-10-01-01",
+    "start": "2026-10-01T01:00:00Z",
+    "end":   "2026-10-01T09:00:00Z",
+    "exhibit_ids": ["EX-101", "EX-102"],
+    "max_rate_lux_per_second": 1.0,
+    "stuck_tolerance_lux": 2.0,
+    "min_stuck_seconds": 1800
+  }'
+```
+
+全部通过时固化合规凭证（`digest` 为规范化输入 + 各项证据摘要的 SHA-256）：
+
+```json
+{
+  "request_key": "hall-open-2026-10-01-am",
+  "round_id": "ROUND-2026-10-01-01",
+  "round_digest": "a3f1…",
+  "start": "2026-10-01T01:00:00Z",
+  "end": "2026-10-01T09:00:00Z",
+  "status": "compliant",
+  "credential_id": "9c4f…",
+  "digest": "b3c1…",
+  "exhibits": [
+    {
+      "requested_id": "EX-101", "canonical_id": "EX-101",
+      "compliant": true, "reasons": [],
+      "location": {"status": "located",
+                   "expected_area": "A区展柜", "actual_area": "A区展柜"},
+      "dose": {"dose_limit_luxh": 150.0, "known_dose_luxh": 120.0,
+               "remaining_luxh": 30.0, "exceeded": false,
+               "first_exceeded_at": null, "unknown_seconds": 0.0,
+               "covered_seconds": 28800.0, "closed_seconds": 0.0,
+               "reading_count": 17},
+      "events": [],
+      "open_ticket_ids": []
+    },
+    {"requested_id": "EX-102", "canonical_id": "EX-102", "…": "同口径证据"}
+  ],
+  "created_at": "2026-10-01T09:05:00.000Z",
+  "already_committed": false
+}
+```
+
+### 27. 不合规：逐件原因，不写入
+
+任一件不合规即整体 `status=non_compliant`（HTTP 200），逐件给出全部原因，
+**不落库**（随后 GET 仍为 404，同一 `request_key` 可在条件修复后重新核验）：
+
+```json
+{
+  "request_key": "hall-open-2026-10-02-am",
+  "round_id": "ROUND-2026-10-02-01",
+  "round_digest": "c7d2…",
+  "start": "2026-10-02T01:00:00Z", "end": "2026-10-02T09:00:00Z",
+  "status": "non_compliant",
+  "credential_id": null, "digest": null, "created_at": null,
+  "exhibits": [
+    {
+      "requested_id": "EX-101", "canonical_id": "EX-101",
+      "compliant": false,
+      "reasons": [
+        {"code": "inventory_misplaced",
+         "detail": "盘点轮次中定位为错位：预期区域 A区展柜，实际定位 C区库房"},
+        {"code": "open_tickets",
+         "detail": "存在 1 张未结处置单: 7f3a…"}
+      ],
+      "location": {"status": "misplaced",
+                   "expected_area": "A区展柜", "actual_area": "C区库房"},
+      "dose": {"…": "…"}, "events": [],
+      "open_ticket_ids": ["7f3a…"]
+    }
+  ],
+  "already_committed": false
+}
+```
+
+原因代码（一件可有多条）：
+
+| code | 含义 |
+|---|---|
+| `inventory_missing` | 盘点缺失：预期区域全程无有效读头事件 |
+| `inventory_misplaced` | 盘点错位：判定区域与预期区域不同 |
+| `inventory_unknown_position` | 位置不明：最后窗口多区域信号差不足阈值 |
+| `inventory_unexpected` | 不在轮次预期清单中但被读到（意外出现） |
+| `inventory_not_covered` | 轮次既无预期也无观测记录，无法确认位置 |
+| `calendar_missing` | 未配置展陈开放日历，无法核算开放剂量 |
+| `dose_exceeded` | 截至窗口末的开放剂量已越限 |
+| `diagnosis_events` | 窗口内存在 gap / jump / stuck 事件（证据 `events` 中给出明细） |
+| `open_tickets` | 存在未结（open）照度异常处置单（`open_ticket_ids` 给出明细） |
+
+### 28. request_key 重放、409 与凭证查询
+
+`request_key` 与（**规范化输入** + **当时证据摘要**）一一绑定：
+
+- 规范化口径：`start` / `end` 统一为 UTC `Z` 结尾；展品 ID 全部解析为
+  **规范档案 ID** 并排序（清单顺序、归并别名写法、等价时区写法都不影响
+  摘要）；诊断阈值按浮点稳定序列化参与哈希；
+- 证据摘要：规范化输入 + 轮次 `request_digest` + 逐件证据（盘点定位结论、
+  `calendar=display` 剂量、窗口内诊断事件、未结处置单 ID）的 SHA-256。
+
+```bash
+# 相同 request_key + 规范化输入相同 + 证据摘要未变 → 200，重放首次凭证
+curl -s -X POST http://localhost:8000/compliance-checks \
+  -H 'Content-Type: application/json' -d '{ ... 同一请求 ... }'
+# {"...": "...", "already_committed": true}
+
+# 同 request_key 换时间窗 / 轮次 / 展品清单 / 诊断阈值 → 409（规范化输入不同）
+# 固化后读数、日历、诊断事件或处置单状态发生变化 → 409（证据摘要已变化），
+# 需换用新的 request_key 重新核验
+
+# 查询已固化的合规凭证（从未核验成功 → 404）
+curl -s http://localhost:8000/compliance-checks/hall-open-2026-10-01-am
+```
+
+- 并发提交相同 `request_key`：只固化一份凭证，竞争方按输入与摘要异同得到
+  回放或 409；
+- 凭证**只增不改**：落库后绝不 UPDATE；核验不写照度读数、展陈日历、盘点
+  轮次、处置单与存证收据链；
+- 错误码小结：展品不存在 → 404；盘点轮次未对账 → 404；凭证未固化（GET）
+  → 404；展品清单解析后重复 / `end` 不晚于 `start` → 422；`request_key`
+  换目标或证据摘要已变化 → 409。
+
 ## 核算语义
 
 - **梯形法**：相邻两条权威读数之间照度按线性变化处理，
@@ -1516,8 +1684,9 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── receipts.py  # 照度上报存证：收据规范序列化、SHA-256 链哈希、整链校验
 │   ├── corrections.py # 上报批次更正：作废收据中实际插入的读数、request_key 幂等、前置变化整次 409
 │   ├── tickets.py   # 照度异常处置单：创建时单事务重算诊断/剂量/链尾并固化快照，结案重算核对（409 不写入）、resolved 举证
+│   ├── compliance.py # 展厅开放批次合规核验：单事务核验（盘点定位/开放剂量/诊断事件/未结处置单），全过才固化凭证，request_key 幂等
 │   ├── snapshots.py # SQLite 在线快照：backup 热备、临时文件 + SHA-256 清单 + 原子重命名、只读校验
-│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions / illumination_tickets）
+│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions / illumination_tickets / compliance_credentials）
 │   └── schemas.py   # Pydantic 请求/响应模型
 ├── tests/
 │   ├── test_api.py       # 剂量核算与归并
@@ -1529,6 +1698,7 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── test_inventory.py # RFID 盘点对账：窗口定位、四类差异、别名解析、摘要重放/409、并发固化、隔离性
 │   ├── test_evacuation.py # 应急撤离：容量竞争、半开封闭等待/绕行、路径字典序平局、别名重复 422、无出口 422、只读隔离
 │   ├── test_tickets.py   # 照度异常处置单：快照固化与 digest、request_key 重放/换目标 409、结案核对 409、resolved 举证、并发
+│   ├── test_compliance.py # 展厅开放批次合规核验：凭证固化、逐件失败原因、重放/换目标/证据变化 409、别名、并发
 │   └── test_snapshots.py # 在线快照：事务一致副本、409 并发、原子发布、下载、只读校验与防篡改
 ├── requirements.txt         # 运行时依赖（含 tzdata，保证容器内 IANA 时区数据库可用）
 ├── requirements-dev.txt     # 测试依赖

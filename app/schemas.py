@@ -1066,3 +1066,125 @@ class IlluminationTicketCloseOut(IlluminationTicketOut):
         default=None,
         description="resolved 结案证明：重算后 calendar=display 剂量是否越限（结案要求为 false）",
     )
+
+
+# ---------- 展厅开放批次合规核验 ----------
+
+class ComplianceCheckRequest(BaseModel):
+    """展厅开放批次合规核验请求：时间窗 + 盘点轮次 + 展品清单 + 诊断阈值 + 幂等键。"""
+
+    request_key: str = Field(
+        min_length=1, max_length=200,
+        description="核验幂等键：仅在规范化输入与当时证据摘要都一致时重放首次凭证；"
+                    "任一不同 → 409；核验失败不落库、不占用该键",
+    )
+    round_id: str = Field(min_length=1, max_length=200,
+                          description="已固化的 RFID 盘点轮次 ID（须已完成对账）")
+    start: datetime = Field(description="核验窗口起点（含），ISO 8601；缺省时区按 UTC 处理")
+    end: datetime = Field(description="核验窗口终点（含），ISO 8601；缺省时区按 UTC 处理")
+    exhibit_ids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        min_length=1, max_length=10000,
+        description="待核验展品 ID 清单（可用归并别名，提交时解析为规范档案；"
+                    "解析后同一规范档案出现多次 → 422）",
+    )
+    max_rate_lux_per_second: float = Field(
+        gt=0, description="照度最大允许变化速率（lux/秒），与诊断接口同口径",
+    )
+    stuck_tolerance_lux: float = Field(
+        ge=0, description="卡死容差（lux），与诊断接口同口径",
+    )
+    min_stuck_seconds: float = Field(
+        gt=0, description="卡死事件最短持续时长（秒），与诊断接口同口径",
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        return ensure_aware(v)
+
+
+class ComplianceLocationOut(BaseModel):
+    """一件展品在盘点轮次固化结果中的定位结论。"""
+
+    status: Literal["located", "missing", "misplaced", "unknown_position",
+                    "unexpected", "not_covered"] = Field(
+        description="located：定位到预期区域（唯一合规）；missing：缺失；misplaced：错位；"
+                    "unknown_position：位置不明；unexpected：不在预期清单但被读到；"
+                    "not_covered：轮次既无预期也无观测记录",
+    )
+    expected_area: str | None = Field(description="轮次中的预期区域；无预期记录为 null")
+    actual_area: str | None = Field(description="轮次判定的实际区域；定位成功（含错位）时给出")
+
+
+class ComplianceReasonOut(BaseModel):
+    """一条不合规原因（逐件给出，一件可有多条）。"""
+
+    code: Literal["inventory_missing", "inventory_misplaced",
+                  "inventory_unknown_position", "inventory_unexpected",
+                  "inventory_not_covered", "calendar_missing", "dose_exceeded",
+                  "diagnosis_events", "open_tickets"] = Field(
+        description="原因代码：盘点定位 / 未配置日历 / 开放剂量越限 / "
+                    "窗口内 gap-jump-stuck 事件 / 未结处置单",
+    )
+    detail: str = Field(description="原因说明（含具体区域、事件统计、处置单 ID 等）")
+
+
+class ComplianceDoseOut(BaseModel):
+    """截至窗口末按 calendar=display 口径重算的剂量证据摘要。"""
+
+    dose_limit_luxh: float
+    known_dose_luxh: float = Field(description="窗口内已知剂量（lux·h）")
+    remaining_luxh: float = Field(description="截至窗口末、按开放历史累计的剩余额度（lux·h）")
+    exceeded: bool = Field(description="截至窗口末开放历史累计是否已越线（合规要求 false）")
+    first_exceeded_at: str | None = Field(description="全历史首次越线时刻；未越线为 null")
+    unknown_seconds: float
+    covered_seconds: float
+    closed_seconds: float = Field(description="窗口内闭馆时长（秒）")
+    reading_count: int
+
+
+class ComplianceExhibitOut(BaseModel):
+    """一件展品的核验结果与证据摘要。"""
+
+    requested_id: str = Field(description="请求清单中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="别名解析后的规范档案 ID")
+    compliant: bool = Field(description="该件是否通过全部核验项")
+    reasons: list[ComplianceReasonOut] = Field(description="不合规原因（合规时为空）")
+    location: ComplianceLocationOut = Field(description="盘点轮次固化结果中的定位结论")
+    dose: ComplianceDoseOut | None = Field(
+        description="截至窗口末的 calendar=display 剂量证据；未配置展陈日历为 null",
+    )
+    events: list[DiagnosisEventOut] = Field(
+        description="完整时间线上与窗口相交的诊断事件（与诊断接口同口径）；"
+                    "合规判定只拦截 gap / jump / stuck，timestamp_conflict 仅记录",
+    )
+    open_ticket_ids: list[str] = Field(
+        description="该规范档案当前未结（open）的照度异常处置单 ID（合规要求为空）",
+    )
+
+
+class ComplianceCheckOut(BaseModel):
+    """批次合规核验结果；合规时即固化的合规凭证。"""
+
+    request_key: str = Field(description="核验幂等键")
+    round_id: str = Field(description="核验依据的盘点轮次 ID")
+    round_digest: str = Field(description="该轮次固化时绑定的规范化请求摘要（SHA-256）")
+    start: str = Field(description="核验窗口起点（UTC，ISO 8601，Z 结尾）")
+    end: str = Field(description="核验窗口终点（UTC，ISO 8601，Z 结尾）")
+    status: Literal["compliant", "non_compliant"] = Field(
+        description="compliant：全部通过且凭证已固化；non_compliant：存在不合规项，未写入任何记录",
+    )
+    credential_id: str | None = Field(description="合规凭证 ID；non_compliant 为 null")
+    digest: str | None = Field(
+        description="凭证摘要：规范化输入 + 各项证据摘要的规范序列化 SHA-256；"
+                    "non_compliant 为 null",
+    )
+    exhibits: list[ComplianceExhibitOut] = Field(
+        description="逐件核验结果与证据摘要（按请求清单顺序）",
+    )
+    created_at: str | None = Field(description="凭证固化时刻（UTC，ISO 8601，Z 结尾）；non_compliant 为 null")
+    already_committed: bool = Field(
+        default=False,
+        description="true 表示相同 request_key 且规范化输入与当时摘要一致的重放，"
+                    "返回的是首次固化的凭证",
+    )

@@ -27,6 +27,7 @@ from .calendar import (
     save_calendar,
 )
 from .corrections import correct_receipt, voids_for_rows
+from .compliance import load_credential, verify_batch
 from .db import get_conn, init_db
 from .diagnose import build_events, intersect_window, sort_events
 from .dose import compute_dose
@@ -48,6 +49,8 @@ from .schemas import (
     ChainFailureOut,
     ChainReceiptsOut,
     ChainVerifyOut,
+    ComplianceCheckOut,
+    ComplianceCheckRequest,
     DiagnoseRequest,
     DiagnoseResponse,
     DiagnosisEventOut,
@@ -114,7 +117,7 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="馆藏展品光照剂量核算 API",
-    version="1.10.0",
+    version="1.11.0",
     description="登记展品光照上限，接收乱序/补传照度读数，按梯形法累计 lux·h，缺测段不插值；"
                 "支持展陈开放日历（IANA 时区 + 每周时段 + 日期例外），剂量可按开放时段裁剪核算；"
                 "支持重复展品档案预演归并，来源 ID 归并后成为目标 ID 的永久别名；"
@@ -146,7 +149,11 @@ app = FastAPI(
                 "（request_key 幂等，快照不可变）；结案只能从 open 到 resolved/accepted，"
                 "提交 expected_digest 与当前重算核对（读数/作废/来源优先级/日历/收据链"
                 "变化导致不一致 → 409 不写入），resolved 须举证涉及收据或更正 "
-                "request_key 并证明原事件消失且剂量未越限，accepted 保留事件并记录理由。",
+                "request_key 并证明原事件消失且剂量未越限，accepted 保留事件并记录理由。"
+                "支持展厅开放批次合规核验：单个写事务内解析别名、读取盘点轮次固化结果、"
+                "逐件重算截至窗口末的 calendar=display 剂量与完整诊断事件、检查未结处置单；"
+                "全部通过才固化含各项证据摘要的合规凭证，任一失败逐件返回原因且不写入；"
+                "request_key 仅在规范化输入与当时摘要一致时重放，否则 409。",
     lifespan=lifespan,
 )
 
@@ -1311,3 +1318,48 @@ def plan_exhibit_evacuation(
         results=results,
         total_completion_offset_seconds=total_completion,
     )
+
+
+# ---------- 展厅开放批次合规核验 ----------
+
+@app.post("/compliance-checks", response_model=ComplianceCheckOut, tags=["compliance"])
+def verify_compliance_batch(
+    payload: ComplianceCheckRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> ComplianceCheckOut:
+    """展厅开放批次合规核验：全部通过才固化合规凭证，任一失败逐件返回原因。
+
+    请求给出 ``request_key``、核验时间窗（``start`` / ``end``）、已固化的盘点
+    ``round_id``、展品 ID 清单（可用归并别名）与诊断阈值（与诊断接口同口径）。
+    服务在**一个 SQLite 写事务**内完成：
+
+    - 展品 ID 解析为规范档案（不存在 → 404；解析后同一规范档案重复 → 422）；
+    - 读取该轮次**固化**的盘点结果（轮次未对账 → 404）；
+    - 逐件读取展陈日历，重算**截至窗口末的 calendar=display 剂量**
+      （与剂量接口同口径）与**完整时间线上的诊断事件**（与诊断接口同口径），
+      并检查该规范档案的未结处置单。
+
+    只有所有展品都在盘点中定位到预期区域、窗口内无 gap / jump / stuck、
+    开放剂量未越限且没有未结处置单时，才固化包含各项证据摘要的合规凭证
+    （返回 ``credential_id`` 与 ``digest``）；任一项不满足返回
+    ``status=non_compliant`` 与逐件原因，**不写入任何记录**。
+
+    ``request_key`` 为幂等键：相同 ``request_key`` 仅在规范化输入（时间窗 /
+    轮次 / 展品规范 ID 集合 / 诊断阈值）与当时证据摘要都一致时重放首次凭证
+    （``already_committed=true``），任一不同 → **409**；核验失败不落库，
+    同一 ``request_key`` 可在条件修复后重新核验。
+    """
+    return verify_batch(conn, payload)
+
+
+@app.get("/compliance-checks/{request_key}", response_model=ComplianceCheckOut,
+         tags=["compliance"])
+def get_compliance_check(
+    request_key: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> ComplianceCheckOut:
+    """按 request_key 取回已固化的合规凭证；从未核验成功（或核验失败未固化）返回 404。"""
+    out = load_credential(conn, request_key)
+    if out is None:
+        raise HTTPException(status_code=404, detail=f"合规凭证不存在: {request_key}")
+    return out

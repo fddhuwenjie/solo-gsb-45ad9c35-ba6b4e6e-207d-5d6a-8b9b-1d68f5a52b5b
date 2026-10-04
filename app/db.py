@@ -187,6 +187,20 @@ CREATE TABLE IF NOT EXISTS illumination_tickets (
     closed_digest           TEXT                   -- 结案时重算核对的摘要
 );
 
+-- 展厅开放批次合规核验凭证：request_key 为幂等键，与（规范化输入摘要 +
+-- 当时证据摘要）绑定。仅在全部展品核验通过时固化（任一失败不写入）；
+-- 相同 request_key 重放须规范化输入与当时摘要都一致，否则 409。
+-- 凭证只增不改：落库后绝不 UPDATE；与 ingest_receipts 一样故意不设外键、
+-- 不级联删除，档案归并后凭证连同其证据摘要原样保留供事后核查。
+CREATE TABLE IF NOT EXISTS compliance_credentials (
+    request_key    TEXT PRIMARY KEY,       -- 核验幂等键
+    request_digest TEXT NOT NULL,          -- 规范化输入摘要 SHA-256（时间 UTC、别名解析后）
+    digest         TEXT NOT NULL,          -- 凭证摘要：规范化输入 + 各项证据摘要的 SHA-256
+    credential_id  TEXT NOT NULL UNIQUE,   -- 凭证 ID
+    result_json    TEXT NOT NULL,          -- 固化的合规凭证（ComplianceCheckOut 合规形态）
+    created_at     TEXT NOT NULL           -- 固化时刻（UTC ISO）
+);
+
 -- 多来源读数仲裁：来源优先级版本。每版携带生效时刻 effective_at 与来源
 -- 优先级列表（JSON 数组，靠前优先级更高；未列入的来源并列最低）。
 -- 版本只增不改：配置更新必须携带 expected_version（当前最新版本号），
